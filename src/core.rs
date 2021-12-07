@@ -1,22 +1,32 @@
 use std::{
     fmt::Display,
     io::{Cursor, Read},
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
 };
 
+use async_trait::async_trait;
 use bytes::{Buf, BufMut, BytesMut};
-use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Future};
+use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-#[async_trait::async_trait]
+#[async_trait]
 pub trait SocksAuth<IO> {
     async fn select(&self, methods: Vec<Method>) -> Method;
 
     async fn auth(&self, io: &mut IO, method: Method) -> std::io::Result<()>;
 }
 
-#[async_trait::async_trait]
-pub trait DnsResolve {
-    async fn resolve(&self, domain: String, port: u16) -> std::io::Result<SocketAddr>;
+// #[async_trait]
+// pub trait DnsResolve {
+//     async fn resolve(&self, domain: String, port: u16) -> std::io::Result<SocketAddr>;
+// }
+
+#[async_trait]
+pub trait Socks5Ex<T> {
+    async fn authenticate(
+        self,
+        auth: Option<Arc<dyn SocksAuth<T> + Send + Sync + 'static>>,
+    ) -> std::io::Result<Socks<T>>;
 }
 
 #[derive(Clone, Debug, Copy)]
@@ -35,25 +45,34 @@ pub enum Method {
     NotSupport,
 }
 
-enum State<IO, T> {
+enum State<IO> {
     Handshake(u8, u8),
     Auth(Method),
     ///     ver cmd rsv atype
     Request(u8, u8, u8, u8),
     Err(String),
-    Ok(Socks<IO, T>),
+    Ok(Socks<IO>),
 }
 
-pub enum Socks<IO, T> {
-    Tcp(IO, SocketAddr),
-    Udp(IO, T),
+#[derive(Debug, Clone)]
+pub enum Addr {
+    Socket(SocketAddr),
+    Domain(String, u16),
+}
+
+pub enum Socks<IO> {
+    // ip地址
+    Tcp(IO, Addr),
+    // udp转发
+    Udp(UdpForward<IO>),
 }
 
 struct AType;
 
 #[derive(Debug)]
-pub struct Forward {
-    addr: SocketAddr,
+pub struct UdpForward<Tcp> {
+    tcp: Tcp,
+    addr: Addr,
 }
 
 #[derive(Clone, Debug)]
@@ -67,7 +86,7 @@ impl UdpPack {
         self.addr.clone()
     }
 
-    pub fn data(&self)->&Vec<u8>{
+    pub fn data(&self) -> &Vec<u8> {
         &self.data
     }
 
@@ -95,44 +114,43 @@ impl UdpPack {
     }
 }
 
-impl Forward {
-    pub fn new(addr: SocketAddr) -> Self {
-        Forward { addr }
+impl<Tcp> UdpForward<Tcp> {
+    pub fn new(tcp: Tcp, addr: Addr) -> Self {
+        UdpForward { tcp, addr }
     }
 
-    pub async fn unpack<Dns>(&self, data: &[u8], dns: &Dns) -> std::io::Result<UdpPack>
-    where
-        Dns: DnsResolve + Sync + Send + 'static,
-    {
-        // |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
+    // pub async fn unpack<Dns>(&self, data: &[u8], dns: &Dns) -> std::io::Result<UdpPack>
+    // where
+    //     Dns: DnsResolve + Sync + Send + 'static,
+    // {
+    //     // |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
 
-        let mut cur = Cursor::new(data);
+    //     let mut cur = Cursor::new(data);
 
-        let _ = cur.get_u16();
-        let _ = cur.get_u8();
-        let atyp = cur.get_u8();
+    //     let _ = cur.get_u16();
+    //     let _ = cur.get_u8();
+    //     let atyp = cur.get_u8();
 
-        let data = {
-            let mut len = cur.position();
+    //     let data = {
+    //         let mut len = cur.position();
 
-            if atyp == 0x03 {
-                len += 1;
-            }
+    //         if atyp == 0x03 {
+    //             len += 1;
+    //         }
 
-            cur.into_inner()[len as usize..].to_vec()
-        };
+    //         cur.into_inner()[len as usize..].to_vec()
+    //     };
 
-        let addr = AType::parse(atyp, &data, dns).await?;
+    //     let addr = AType::parse(atyp, &data, dns).await?;
 
-        Ok(UdpPack {
-            addr,
-            data: data[AType::len(atyp)..].to_vec(),
-        })
-    }
+    //     Ok(UdpPack {
+    //         addr,
+    //         data: data[AType::len(atyp)..].to_vec(),
+    //     })
+    // }
 }
 
-
-impl<IO, T> Display for State<IO, T> {
+impl<IO> Display for State<IO> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let fmt = match self {
             State::Handshake(ver, nmethod) => format!("ver={}, nmethod={}", ver, nmethod),
@@ -194,24 +212,21 @@ impl AType {
         }
     }
 
-    pub async fn parse<Dns>(atype: u8, buf: &[u8], dns: &Dns) -> std::io::Result<SocketAddr>
-    where
-        Dns: DnsResolve + Sync + Send + 'static,
-    {
+    pub async fn parse(atype: u8, buf: &[u8]) -> std::io::Result<Addr> {
         let len = buf.len();
         let mut cur = Cursor::new(buf);
 
         log::trace!("[socks] parse address {:?}", buf);
 
         match atype {
-            0x01 => Ok(SocketAddr::new(
+            0x01 => Ok(Addr::Socket(SocketAddr::new(
                 IpAddr::V4(cur.get_u32().into()),
                 cur.get_u16(),
-            )),
-            0x04 => Ok(SocketAddr::new(
+            ))),
+            0x04 => Ok(Addr::Socket(SocketAddr::new(
                 IpAddr::V6(cur.get_u128().into()),
                 cur.get_u16(),
-            )),
+            ))),
             0x03 => {
                 let mut domain = Vec::new();
 
@@ -224,7 +239,7 @@ impl AType {
 
                 log::debug!("[socks] resolve {}:{}", domain, port);
 
-                Ok(dns.resolve(domain, port).await?)
+                Ok(Addr::Domain(domain, port))
             }
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -234,22 +249,14 @@ impl AType {
     }
 }
 
-impl<T, IO> Socks<IO, T>
+impl<IO> Socks<IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Clone + Send + Sync + 'static,
 {
-    pub async fn parse<Auth, U, F, Dns>(
+    pub async fn parse(
         mut io: IO,
-        udp_forward: U,
-        auth: &Auth,
-        dns_resolve: &Dns,
-    ) -> std::io::Result<Self>
-    where
-        Auth: SocksAuth<IO> + Send + Sync + 'static,
-        U: Fn(SocketAddr, Forward) -> F,
-        F: Future<Output = std::io::Result<(T, SocketAddr)>>,
-        Dns: DnsResolve + Sync + Send + 'static,
-    {
+        auth: Option<Arc<dyn SocksAuth<IO> + Send + Sync + 'static>>,
+    ) -> std::io::Result<Self> {
         let mut write_buf = BytesMut::new();
 
         let mut read_buf = BytesMut::new();
@@ -263,7 +270,7 @@ where
             }
 
             match state {
-                State::Handshake(ver, _) if ver == 0 && read_buf.len() == 2 => {
+                State::Handshake(0, _) if read_buf.len() == 2 => {
                     let ver = read_buf.get_u8();
                     let nmethod = read_buf.get_u8();
 
@@ -278,14 +285,19 @@ where
                 State::Handshake(ver, _) => {
                     log::debug!("[socks] {}", state);
 
-                    let method = auth
-                        .select(
-                            read_buf
-                                .iter()
-                                .map(|e| e.try_into())
-                                .collect::<std::io::Result<Vec<Method>>>()?,
-                        )
-                        .await;
+                    let method = {
+                        if let Some(auth) = auth.as_ref() {
+                            auth.select(
+                                read_buf
+                                    .iter()
+                                    .map(|e| e.try_into())
+                                    .collect::<std::io::Result<Vec<Method>>>()?,
+                            )
+                            .await
+                        } else {
+                            Method::No
+                        }
+                    };
 
                     state = match method {
                         Method::No => {
@@ -299,14 +311,14 @@ where
                     write_buf.put_u8(method.into());
                 }
                 State::Auth(method) => {
-                    auth.auth(&mut io, method).await?;
+                    auth.as_ref().unwrap().auth(&mut io, method).await?;
 
                     read_buf.resize(4, 0);
                     state = State::Request(0, 0, 0, 0);
 
                     log::debug!("[socks] Auth success");
                 }
-                State::Request(ver, _, _, _) if ver == 0 && read_buf.len() == 4 => {
+                State::Request(0, _, _, _) if read_buf.len() == 4 => {
                     let ver = read_buf.get_u8();
                     if ver != 0x05 {
                         read_buf.clear();
@@ -336,7 +348,7 @@ where
                         }
                     }
                 }
-                State::Request(ver, cmd, rsv, atype) if atype == 0x03 && read_buf.len() == 1 => {
+                State::Request(ver, cmd, rsv, 0x03) if read_buf.len() == 1 => {
                     let len = read_buf.get_u8();
 
                     if len == 0 {
@@ -345,44 +357,37 @@ where
                         log::debug!("[socks] domain_len={}", len);
                         // domian  + port
                         read_buf.resize(len as usize + 2, 0);
-                        state = State::Request(ver, cmd, rsv, atype)
+                        state = State::Request(ver, cmd, rsv, 0x03)
                     }
                 }
                 State::Request(ver, cmd, rsv, atype) => {
-                    let addr =
-                        if let Ok(addr) = AType::parse(atype, &mut read_buf, dns_resolve).await {
-                            match cmd {
-                                // connect
-                                0x01 => {
-                                    state = State::Ok(Socks::Tcp(io.clone(), addr));
-                                    Some(addr)
-                                }
-                                // udp forward
-                                0x03 => udp_forward(addr, Forward::new(addr)).await.map_or(
-                                    None,
-                                    |(o, addr)| {
-                                        state = State::Ok(Socks::Udp(io.clone(), o));
-                                        Some(addr)
-                                    },
-                                ),
-                                // bind
-                                0x02 => {
-                                    state = State::Err(String::from("Bind not support"));
-                                    None
-                                }
-                                _ => {
-                                    log::debug!("unsupport");
-                                    None
-                                }
+                    let addr = if let Ok(addr) = AType::parse(atype, &mut read_buf).await {
+                        match cmd {
+                            // connect
+                            0x01 => {
+                                state = State::Ok(Socks::Tcp(io.clone(), addr.clone()));
+                                Some(addr)
                             }
-                        } else {
-                            None
-                        };
+                            // udp forward
+                            0x03 => return Ok(Socks::Udp(UdpForward::new(io, addr))),
+                            // bind
+                            0x02 => {
+                                state = State::Err(String::from("Bind not support"));
+                                None
+                            }
+                            _ => {
+                                log::debug!("unsupport");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
 
-                    let (rep, addr) =
-                        addr.map_or((0x05, "0.0.0.0:0".parse().unwrap()), |addr| (0x00, addr));
+                    let rep = addr.map_or(0x05, |_| 0x00);
+                    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
 
-                    read_buf.clear();   
+                    read_buf.clear();
                     write_buf.clear();
                     write_buf.put_u8(ver);
                     write_buf.put_u8(rep);
@@ -410,7 +415,7 @@ where
                 }
                 State::Err(e) => {
                     break Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                        std::io::ErrorKind::InvalidData,
                         e.to_string(),
                     ))
                 }
@@ -422,5 +427,69 @@ where
                 write_buf.clear();
             }
         }
+    }
+}
+
+#[async_trait]
+impl<T> Socks5Ex<T> for T
+where
+    T: AsyncRead + AsyncWrite + Unpin + Clone + Send + Sync + 'static,
+{
+    #[inline]
+    async fn authenticate(
+        self,
+        auth: Option<Arc<dyn SocksAuth<T> + Send + Sync + 'static>>,
+    ) -> std::io::Result<Socks<T>> {
+        Socks::parse(self, auth).await
+    }
+}
+
+impl<Tcp> UdpForward<Tcp>
+where
+    Tcp: AsyncWrite + AsyncRead + Unpin + Send + Sync + 'static,
+{
+    #[inline]
+    pub async fn resolve<Udp>(mut self, addr: SocketAddr) -> std::io::Result<Tcp> {
+        let mut buf = BytesMut::new();
+
+        buf.put_slice(&[0x05, 0x00, 0x00]);
+
+        match addr {
+            SocketAddr::V4(v4) => {
+                buf.put_u8(0x01);
+                buf.put_slice(&v4.ip().octets());
+                buf.put_u16(v4.port());
+            }
+            SocketAddr::V6(v6) => {
+                buf.put_u8(0x04);
+                buf.put_slice(&v6.ip().octets());
+                buf.put_u16(v6.port());
+            }
+        }
+
+        self.tcp.write_all(&buf).await?;
+
+        Ok(self.tcp)
+    }
+
+    #[inline]
+    pub async fn reject(mut self) -> std::io::Result<()> {
+        self.tcp
+            .write_all(&[0x05, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+            .await?;
+        Ok(())
+    }
+}
+
+impl Display for Addr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "{}",
+            match self {
+                Addr::Socket(addr) => addr.to_string(),
+                Addr::Domain(domain, port) => format!("{}:{}", domain, port),
+            }
+        )
     }
 }
