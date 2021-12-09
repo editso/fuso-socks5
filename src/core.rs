@@ -1,13 +1,13 @@
 use std::{
     fmt::Display,
     io::{Cursor, Read},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     sync::Arc,
 };
 
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, BytesMut};
-use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Future};
 
 #[async_trait]
 pub trait SocksAuth<IO> {
@@ -67,6 +67,18 @@ pub enum Socks<IO> {
     Udp(UdpForward<IO>),
 }
 
+#[derive(Clone, Debug)]
+pub struct ForwardPacket {
+    addr: Addr,
+    data: Vec<u8>,
+}
+
+#[async_trait]
+pub trait AsyncUdpForward {
+    async fn recv_udp(&mut self) -> std::io::Result<ForwardPacket>;
+    async fn send_udp(&mut self, addr: SocketAddr, data: &[u8]) -> std::io::Result<()>;
+}
+
 struct AType;
 
 #[derive(Debug)]
@@ -75,27 +87,24 @@ pub struct UdpForward<Tcp> {
     addr: Addr,
 }
 
-#[derive(Clone, Debug)]
-pub struct UdpPack {
-    addr: SocketAddr,
-    data: Vec<u8>,
-}
-
-impl UdpPack {
-    pub fn addr(&self) -> SocketAddr {
-        self.addr.clone()
-    }
-
+impl ForwardPacket {
+    #[inline]
     pub fn data(&self) -> &Vec<u8> {
         &self.data
     }
 
-    pub fn pack(&self, data: &[u8]) -> Vec<u8> {
+    #[inline]
+    pub fn addr(&self) -> Addr {
+        self.addr.clone()
+    }
+
+    #[inline]
+    pub fn pack(addr: SocketAddr, data: &[u8]) -> Vec<u8> {
         let mut buf = BytesMut::new();
         buf.put_u16(0x0);
         buf.put_u8(0x0);
-
-        match self.addr {
+        // buf.put_slice(&[0x01, 0, 0, 0, 0, 0, 0]);
+        match addr {
             SocketAddr::V4(v4) => {
                 buf.put_u8(0x01);
                 buf.put_slice(&v4.ip().octets());
@@ -112,42 +121,41 @@ impl UdpPack {
 
         buf.to_vec()
     }
+
+    #[inline]
+    pub async fn unpack(data: &[u8]) -> std::io::Result<Self> {
+        // |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
+
+        let mut cur = Cursor::new(data);
+
+        let _ = cur.get_u16();
+        let _ = cur.get_u8();
+        let atyp = cur.get_u8();
+
+        let data = {
+            let mut len = cur.position();
+
+            if atyp == 0x03 {
+                len += 1;
+            }
+
+            cur.into_inner()[len as usize..].to_vec()
+        };
+
+        let addr = AType::parse(atyp, &data).await?;
+
+        Ok(Self {
+            addr,
+            data: data[AType::len(atyp)..].to_vec(),
+        })
+    }
 }
 
 impl<Tcp> UdpForward<Tcp> {
+    #[inline]
     pub fn new(tcp: Tcp, addr: Addr) -> Self {
         UdpForward { tcp, addr }
     }
-
-    // pub async fn unpack<Dns>(&self, data: &[u8], dns: &Dns) -> std::io::Result<UdpPack>
-    // where
-    //     Dns: DnsResolve + Sync + Send + 'static,
-    // {
-    //     // |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
-
-    //     let mut cur = Cursor::new(data);
-
-    //     let _ = cur.get_u16();
-    //     let _ = cur.get_u8();
-    //     let atyp = cur.get_u8();
-
-    //     let data = {
-    //         let mut len = cur.position();
-
-    //         if atyp == 0x03 {
-    //             len += 1;
-    //         }
-
-    //         cur.into_inner()[len as usize..].to_vec()
-    //     };
-
-    //     let addr = AType::parse(atyp, &data, dns).await?;
-
-    //     Ok(UdpPack {
-    //         addr,
-    //         data: data[AType::len(atyp)..].to_vec(),
-    //     })
-    // }
 }
 
 impl<IO> Display for State<IO> {
@@ -385,7 +393,7 @@ where
                     };
 
                     let rep = addr.map_or(0x05, |_| 0x00);
-                    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
+                    let addr = ([0, 0, 0, 0], 0).into();
 
                     read_buf.clear();
                     write_buf.clear();
@@ -449,7 +457,11 @@ where
     Tcp: AsyncWrite + AsyncRead + Unpin + Send + Sync + 'static,
 {
     #[inline]
-    pub async fn resolve<Udp>(mut self, addr: SocketAddr) -> std::io::Result<Tcp> {
+    pub async fn resolve<F, Fut>(mut self, addr: SocketAddr, forward: F) -> std::io::Result<()>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = std::io::Result<()>>,
+    {
         let mut buf = BytesMut::new();
 
         buf.put_slice(&[0x05, 0x00, 0x00]);
@@ -469,7 +481,20 @@ where
 
         self.tcp.write_all(&buf).await?;
 
-        Ok(self.tcp)
+        let mut tcp = self.tcp;
+
+        let guard_future = async move {
+            let mut buf = [0; 1];
+
+            let _ = tcp.read(&mut buf).await;
+
+            log::debug!("[socks] udp forward close")
+        };
+
+        futures::future::select(Box::pin(guard_future), Box::pin(forward())).await;
+
+        // Ok(self.tcp)
+        Ok(())
     }
 
     #[inline]
@@ -477,6 +502,7 @@ where
         self.tcp
             .write_all(&[0x05, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
             .await?;
+        let _ = self.tcp.close().await?;
         Ok(())
     }
 }
@@ -491,5 +517,28 @@ impl Display for Addr {
                 Addr::Domain(domain, port) => format!("{}:{}", domain, port),
             }
         )
+    }
+}
+
+#[async_trait]
+impl<T> AsyncUdpForward for T
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    #[inline]
+    async fn recv_udp(&mut self) -> std::io::Result<ForwardPacket> {
+        let mut buf = Vec::new();
+        buf.resize(1500, 0);
+
+        let n = self.read(&mut buf).await?;
+
+        buf.truncate(n);
+
+        ForwardPacket::unpack(&buf).await
+    }
+
+    #[inline]
+    async fn send_udp(&mut self, addr: SocketAddr, data: &[u8]) -> std::io::Result<()> {
+        self.write_all(&ForwardPacket::pack(addr, data)).await
     }
 }
