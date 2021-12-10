@@ -488,6 +488,8 @@ where
 
             let _ = tcp.read(&mut buf).await;
 
+            let _ = tcp.close().await;
+
             log::debug!("[socks] udp forward close")
         };
 
@@ -528,7 +530,7 @@ where
     #[inline]
     async fn recv_udp(&mut self) -> std::io::Result<ForwardPacket> {
         let mut buf = Vec::new();
-        buf.resize(1500, 0);
+        buf.resize(1400, 0);
 
         let n = self.read(&mut buf).await?;
 
