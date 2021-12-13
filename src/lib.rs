@@ -1,46 +1,52 @@
 mod core;
 
-use futures::{AsyncRead, AsyncWrite};
+use futures::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 pub use crate::core::*;
 
 #[derive(Default)]
-pub struct DefauleDnsResolve {}
-
-#[derive(Default)]
-pub struct PasswordAuth {}
+pub struct PasswordAuth(pub String);
 
 #[async_trait::async_trait]
 impl<IO> SocksAuth<IO> for PasswordAuth
 where
-    IO: AsyncRead + AsyncWrite + Send + Sync + 'static,
+    IO: AsyncRead + Unpin + AsyncWrite + Send + Sync + 'static,
 {
     async fn select(&self, _: Vec<Method>) -> Method {
-        Method::No
+        Method::User
     }
 
-    async fn auth(&self, _: &mut IO, _: Method) -> std::io::Result<()> {
+    async fn auth(&self, io: &mut IO, _: Method) -> std::io::Result<()> {
+        let mut buf = Vec::new();
+
+        buf.resize(2, 0);
+
+        io.read_exact(&mut buf).await?;
+
+        let username_len = buf[1];
+
+        buf.resize(username_len as usize + 1, 0);
+
+        io.read_exact(&mut buf).await?;
+
+        let password_len = buf[username_len as usize];
+
+        buf.resize(password_len as usize, 0);
+
+        io.read_exact(&mut buf).await?;
+
+        if !buf.eq(self.0.as_bytes()) {
+            log::warn!("password error {}", String::from_utf8_lossy(&buf));
+
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "socks5 password error",
+            ));
+        }
+
         Ok(())
     }
 }
-
-// #[async_trait::async_trait]
-// impl crate::core::DnsResolve for DefauleDnsResolve {
-//     async fn resolve(&self, domain: String, port: u16) -> std::io::Result<SocketAddr> {
-//         log::debug!("resolve {}", domain);
-
-//         format!("{}:{}", domain, port)
-//             .to_socket_addrs()?
-//             .next()
-//             .map_or(
-//                 Err(std::io::Error::new(
-//                     std::io::ErrorKind::Other,
-//                     "Dns resolve failure",
-//                 )),
-//                 |addr| Ok(addr),
-//             )
-//     }
-// }
 
 #[cfg(test)]
 mod tests {

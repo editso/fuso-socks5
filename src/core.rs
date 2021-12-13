@@ -312,7 +312,10 @@ where
                             read_buf.resize(4, 0);
                             State::Request(0, 0, 0, 0)
                         }
-                        _ => State::Auth(method.clone()),
+                        method => {
+                            read_buf.clear();
+                            State::Auth(method)
+                        }
                     };
 
                     write_buf.put_u8(ver);
@@ -321,10 +324,13 @@ where
                 State::Auth(method) => {
                     auth.as_ref().unwrap().auth(&mut io, method).await?;
 
+                    write_buf.put_u8(0x1);
+                    write_buf.put_u8(0x0);
+
                     read_buf.resize(4, 0);
                     state = State::Request(0, 0, 0, 0);
 
-                    log::debug!("[socks] Auth success");
+                    log::info!("[socks] Auth success");
                 }
                 State::Request(0, _, _, _) if read_buf.len() == 4 => {
                     let ver = read_buf.get_u8();
@@ -363,7 +369,7 @@ where
                         state = State::Err(String::from("Invalid domain"));
                     } else {
                         log::debug!("[socks] domain_len={}", len);
-                        // domian  + port
+                        // domain  + port
                         read_buf.resize(len as usize + 2, 0);
                         state = State::Request(ver, cmd, rsv, 0x03)
                     }
