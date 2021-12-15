@@ -45,6 +45,7 @@ pub enum Method {
     NotSupport,
 }
 
+/// 参考 rfc https://datatracker.ietf.org/doc/html/rfc1928
 enum State<IO> {
     Handshake(u8, u8),
     Auth(Method),
@@ -261,6 +262,7 @@ impl<IO> Socks<IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Clone + Send + Sync + 'static,
 {
+    /// 参考 rfc https://datatracker.ietf.org/doc/html/rfc1928
     pub async fn parse(
         mut io: IO,
         auth: Option<Arc<dyn SocksAuth<IO> + Send + Sync + 'static>>,
